@@ -1,3 +1,4 @@
+```js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -16,57 +17,74 @@ const app = express();
 
 const PORT = Number(process.env.PORT || 3000);
 
-const db = new Database(
-  process.env.DB_FILE || './recyclr.db'
-);
+const db = new Database(process.env.DB_FILE || './recyclr.db');
 
 db.pragma('journal_mode = WAL');
 
 db.exec(`
-CREATE TABLE IF NOT EXISTS users(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  email TEXT UNIQUE NOT NULL,
-  phone TEXT,
-  password_hash TEXT NOT NULL,
-  verified INTEGER DEFAULT 0,
-  points INTEGER DEFAULT 250,
-  created_at TEXT NOT NULL
-);
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    phone TEXT,
+    password_hash TEXT NOT NULL,
+    verified INTEGER DEFAULT 0,
+    points INTEGER DEFAULT 250,
+    created_at TEXT NOT NULL
+  );
 
-CREATE TABLE IF NOT EXISTS otps(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  code_hash TEXT NOT NULL,
-  expires_at INTEGER NOT NULL,
-  attempts INTEGER DEFAULT 0,
-  used INTEGER DEFAULT 0,
-  created_at INTEGER NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES users(id)
-);
+  CREATE TABLE IF NOT EXISTS otps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    code_hash TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    attempts INTEGER DEFAULT 0,
+    used INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    purpose TEXT NOT NULL DEFAULT 'verify',
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
 
-CREATE TABLE IF NOT EXISTS orders(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  razorpay_order_id TEXT UNIQUE NOT NULL,
-  amount INTEGER NOT NULL,
-  currency TEXT NOT NULL,
-  status TEXT DEFAULT 'created',
-  created_at TEXT NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES users(id)
-);
+  CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    razorpay_order_id TEXT UNIQUE NOT NULL,
+    amount INTEGER NOT NULL,
+    currency TEXT NOT NULL,
+    status TEXT DEFAULT 'created',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
 `);
 
 
-/* =========================
-   CORS
-========================= */
+/* =========================================================
+   DATABASE MIGRATION
+   ========================================================= */
 
-const allowedOrigins =
-  (process.env.FRONTEND_ORIGIN || '')
-    .split(',')
-    .map(x => x.trim())
-    .filter(Boolean);
+const otpColumns = db.prepare(`PRAGMA table_info(otps)`).all();
+
+if (!otpColumns.some(column => column.name === 'purpose')) {
+  db.exec(`
+    ALTER TABLE otps
+    ADD COLUMN purpose TEXT NOT NULL DEFAULT 'verify'
+  `);
+}
+
+
+/* =========================================================
+   CORS
+   ========================================================= */
+
+const allowedOrigins = (process.env.FRONTEND_ORIGIN || '')
+  .split(',')
+  .map(x => x.trim())
+  .filter(Boolean);
+
+
+/* =========================================================
+   MIDDLEWARE
+   ========================================================= */
 
 app.use(
   helmet({
@@ -78,16 +96,16 @@ app.use(
 
 app.use(
   cors({
-    origin: (origin, cb) => {
+    origin: (origin, callback) => {
       if (
         !origin ||
         allowedOrigins.length === 0 ||
         allowedOrigins.includes(origin)
       ) {
-        return cb(null, true);
+        return callback(null, true);
       }
 
-      cb(new Error('Origin not allowed'));
+      return callback(new Error('Origin not allowed'));
     }
   })
 );
@@ -108,25 +126,20 @@ app.use(
 );
 
 
-/* =========================
-   EMAIL
-========================= */
+/* =========================================================
+   SMTP
+   ========================================================= */
+
+const smtpPort = Number(process.env.SMTP_PORT || 587);
 
 const mailer =
-  (
-    process.env.SMTP_HOST &&
-    process.env.SMTP_USER &&
-    process.env.SMTP_PASS
-  )
+  process.env.SMTP_HOST &&
+  process.env.SMTP_USER &&
+  process.env.SMTP_PASS
     ? nodemailer.createTransport({
         host: process.env.SMTP_HOST,
-        port: Number(
-          process.env.SMTP_PORT || 587
-        ),
-        secure:
-          Number(
-            process.env.SMTP_PORT || 587
-          ) === 465,
+        port: smtpPort,
+        secure: smtpPort === 465,
         auth: {
           user: process.env.SMTP_USER,
           pass: process.env.SMTP_PASS
@@ -135,15 +148,13 @@ const mailer =
     : null;
 
 
-/* =========================
+/* =========================================================
    RAZORPAY
-========================= */
+   ========================================================= */
 
 const razorpay =
-  (
-    process.env.RAZORPAY_KEY_ID &&
-    process.env.RAZORPAY_KEY_SECRET
-  )
+  process.env.RAZORPAY_KEY_ID &&
+  process.env.RAZORPAY_KEY_SECRET
     ? new Razorpay({
         key_id: process.env.RAZORPAY_KEY_ID,
         key_secret: process.env.RAZORPAY_KEY_SECRET
@@ -151,9 +162,9 @@ const razorpay =
     : null;
 
 
-/* =========================
+/* =========================================================
    HELPERS
-========================= */
+   ========================================================= */
 
 function hashOtp(code) {
   return crypto
@@ -170,8 +181,7 @@ function tokenFor(user) {
       email: user.email,
       name: user.name
     },
-    process.env.JWT_SECRET ||
-      'dev-only-secret-change-me',
+    process.env.JWT_SECRET || 'dev-only-secret-change-me',
     {
       expiresIn: '7d'
     }
@@ -181,10 +191,9 @@ function tokenFor(user) {
 
 function auth(req, res, next) {
   try {
-    const h =
-      req.headers.authorization || '';
+    const header = req.headers.authorization || '';
 
-    if (!h.startsWith('Bearer ')) {
+    if (!header.startsWith('Bearer ')) {
       return res
         .status(401)
         .json({
@@ -192,14 +201,14 @@ function auth(req, res, next) {
         });
     }
 
+    const token = header.slice(7);
+
     req.user = jwt.verify(
-      h.slice(7),
-      process.env.JWT_SECRET ||
-        'dev-only-secret-change-me'
+      token,
+      process.env.JWT_SECRET || 'dev-only-secret-change-me'
     );
 
     next();
-
   } catch {
     return res
       .status(401)
@@ -210,278 +219,372 @@ function auth(req, res, next) {
 }
 
 
-/* =========================
-   EMAIL VERIFICATION OTP
-========================= */
+/* =========================================================
+   OTP CREATION + EMAIL
+   ========================================================= */
 
-async function sendOtp(user) {
-
+async function createAndSendOtp(user, purpose = 'verify') {
   const code = String(
     crypto.randomInt(100000, 1000000)
   );
 
-  db.prepare(
-    'UPDATE otps SET used=1 WHERE user_id=? AND used=0'
-  ).run(user.id);
+  // Invalidate previous unused OTPs of the same purpose
+  db.prepare(`
+    UPDATE otps
+    SET used = 1
+    WHERE user_id = ?
+      AND purpose = ?
+      AND used = 0
+  `).run(user.id, purpose);
 
-  db.prepare(
-    `INSERT INTO otps
-    (user_id,code_hash,expires_at,created_at)
-    VALUES(?,?,?,?)`
-  ).run(
+
+  // Store hashed OTP
+  db.prepare(`
+    INSERT INTO otps (
+      user_id,
+      code_hash,
+      expires_at,
+      attempts,
+      used,
+      created_at,
+      purpose
+    )
+    VALUES (?, ?, ?, 0, 0, ?, ?)
+  `).run(
     user.id,
     hashOtp(code),
     Date.now() + 10 * 60 * 1000,
-    Date.now()
+    Date.now(),
+    purpose
   );
+
+
+  /* ---------------------------------------------------------
+     SMTP NOT CONFIGURED
+     --------------------------------------------------------- */
 
   if (!mailer) {
+    console.error('SMTP is not configured.');
 
-    if (process.env.NODE_ENV === 'production') {
-      throw new Error(
-        'Email service is not configured'
+    // Development mode
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(
+        `[DEV OTP] ${purpose} OTP for ${user.email}: ${code}`
       );
+
+      return code;
     }
 
-    return code;
+    throw new Error(
+      'Email service is not configured on the server'
+    );
   }
 
-  await mailer.sendMail({
-    from:
-      process.env.MAIL_FROM ||
-      process.env.SMTP_USER,
 
-    to: user.email,
+  /* ---------------------------------------------------------
+     SEND EMAIL
+     --------------------------------------------------------- */
 
-    subject:
-      'Your Recyclr verification code',
-
-    text:
-      `Your Recyclr OTP is ${code}. ` +
-      `It expires in 10 minutes.`
-  });
-
-  return process.env.NODE_ENV === 'production'
-    ? undefined
-    : code;
-}
+  const subject =
+    purpose === 'reset'
+      ? 'Your Recyclr password reset OTP'
+      : 'Your Recyclr verification code';
 
 
-/* =========================
-   PASSWORD RESET OTP
-========================= */
-
-async function sendPasswordResetOtp(user) {
-
-  const code = String(
-    crypto.randomInt(100000, 1000000)
-  );
-
-  /*
-    Invalidate any previous unused OTPs
-    for this user.
-  */
-
-  db.prepare(
-    'UPDATE otps SET used=1 WHERE user_id=? AND used=0'
-  ).run(user.id);
-
-  /*
-    Store the new OTP as a hash.
-  */
-
-  db.prepare(
-    `INSERT INTO otps
-    (user_id,code_hash,expires_at,attempts,used,created_at)
-    VALUES(?,?,?,?,?,?)`
-  ).run(
-    user.id,
-    hashOtp(code),
-    Date.now() + 10 * 60 * 1000,
-    0,
-    0,
-    Date.now()
-  );
-
-  /*
-    Email service must exist in production.
-  */
-
-  if (!mailer) {
-
-    if (process.env.NODE_ENV === 'production') {
-      throw new Error(
-        'Email service is not configured'
-      );
-    }
-
-    return code;
-  }
-
-  await mailer.sendMail({
-    from:
-      process.env.MAIL_FROM ||
-      process.env.SMTP_USER,
-
-    to: user.email,
-
-    subject:
-      'Reset your Recyclr password',
-
-    text:
-      `Your Recyclr password reset OTP is ${code}. ` +
-      `It expires in 10 minutes.`
-  });
-
-  return process.env.NODE_ENV === 'production'
-    ? undefined
-    : code;
-}
+  const text =
+    purpose === 'reset'
+      ? `Your Recyclr password reset OTP is ${code}. It expires in 10 minutes.`
+      : `Your Recyclr OTP is ${code}. It expires in 10 minutes.`;
 
 
-/* =========================
-   HEALTH
-========================= */
-
-app.get(
-  '/api/health',
-  (req, res) => {
-    res.json({
-      ok: true,
-      service: 'recyclr-api',
-      time: new Date().toISOString()
+  try {
+    const info = await mailer.sendMail({
+      from: process.env.MAIL_FROM || process.env.SMTP_USER,
+      to: user.email,
+      subject,
+      text
     });
+
+    console.log(
+      `OTP email sent successfully to ${user.email}`
+    );
+
+    console.log(
+      `Message ID: ${info.messageId}`
+    );
+
+    return undefined;
+
+  } catch (error) {
+    console.error(
+      'SMTP EMAIL ERROR:',
+      error
+    );
+
+    // Invalidate OTP if email could not be sent
+    db.prepare(`
+      UPDATE otps
+      SET used = 1
+      WHERE user_id = ?
+        AND purpose = ?
+        AND used = 0
+    `).run(user.id, purpose);
+
+    throw new Error(
+      'Unable to send OTP email. Please check SMTP settings.'
+    );
   }
-);
+}
 
 
-/* =========================
+/* =========================================================
+   HEALTH CHECK
+   ========================================================= */
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'recyclr-api',
+    time: new Date().toISOString()
+  });
+});
+
+
+/* =========================================================
    SIGNUP
-========================= */
+   ========================================================= */
 
-app.post(
-  '/api/auth/signup',
-  async (req, res) => {
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    const {
+      name,
+      email,
+      phone,
+      password
+    } = req.body || {};
 
-    try {
 
-      const {
+    if (
+      !name ||
+      !email ||
+      !password ||
+      password.length < 8
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            'Name, email and an 8+ character password are required'
+        });
+    }
+
+
+    const cleanName = String(name).trim();
+
+    const cleanEmail = String(email)
+      .trim()
+      .toLowerCase();
+
+    const cleanPhone = phone
+      ? String(phone).trim()
+      : null;
+
+
+    /* -------------------------------------------------------
+       CHECK EXISTING ACCOUNT
+       ------------------------------------------------------- */
+
+    const existing = db
+      .prepare(
+        'SELECT * FROM users WHERE email = ?'
+      )
+      .get(cleanEmail);
+
+
+    /* -------------------------------------------------------
+       EXISTING + VERIFIED
+       ------------------------------------------------------- */
+
+    if (existing && existing.verified) {
+      return res
+        .status(409)
+        .json({
+          error:
+            'An account with this email already exists'
+        });
+    }
+
+
+    /* -------------------------------------------------------
+       EXISTING + NOT VERIFIED
+       ------------------------------------------------------- */
+
+    if (existing && !existing.verified) {
+      const passwordHash = await bcrypt.hash(
+        String(password),
+        12
+      );
+
+
+      db.prepare(`
+        UPDATE users
+        SET
+          name = ?,
+          phone = ?,
+          password_hash = ?
+        WHERE id = ?
+      `).run(
+        cleanName,
+        cleanPhone,
+        passwordHash,
+        existing.id
+      );
+
+
+      const user = {
+        id: existing.id,
+        name: cleanName,
+        email: cleanEmail,
+        phone: cleanPhone
+      };
+
+
+      try {
+        const devOtp = await createAndSendOtp(
+          user,
+          'verify'
+        );
+
+
+        return res.json({
+          message:
+            'Account exists but is not verified. A new OTP has been sent.',
+          token: tokenFor(user),
+          devOtp
+        });
+
+      } catch (error) {
+        console.error(
+          'Signup OTP error:',
+          error
+        );
+
+        return res
+          .status(500)
+          .json({
+            error:
+              error.message ||
+              'Unable to send verification OTP'
+          });
+      }
+    }
+
+
+    /* -------------------------------------------------------
+       NEW ACCOUNT
+       ------------------------------------------------------- */
+
+    const passwordHash = await bcrypt.hash(
+      String(password),
+      12
+    );
+
+
+    const info = db.prepare(`
+      INSERT INTO users (
         name,
         email,
         phone,
-        password
-      } = req.body || {};
+        password_hash,
+        created_at
+      )
+      VALUES (?, ?, ?, ?, ?)
+    `).run(
+      cleanName,
+      cleanEmail,
+      cleanPhone,
+      passwordHash,
+      new Date().toISOString()
+    );
 
-      if (
-        !name ||
-        !email ||
-        !password ||
-        password.length < 8
-      ) {
-        return res
-          .status(400)
-          .json({
-            error:
-              'Name, email and an 8+ character password are required'
-          });
-      }
 
-      const exists =
-        db.prepare(
-          'SELECT id FROM users WHERE email=?'
-        ).get(
-          email.toLowerCase()
-        );
+    const user = {
+      id: info.lastInsertRowid,
+      name: cleanName,
+      email: cleanEmail,
+      phone: cleanPhone
+    };
 
-      if (exists) {
-        return res
-          .status(409)
-          .json({
-            error:
-              'An account with this email already exists'
-          });
-      }
 
-      const user = {
-        name: name.trim(),
+    try {
+      const devOtp = await createAndSendOtp(
+        user,
+        'verify'
+      );
 
-        email:
-          email.trim().toLowerCase(),
 
-        phone:
-          phone?.trim() || null
-      };
-
-      const info =
-        db.prepare(
-          `INSERT INTO users
-          (name,email,phone,password_hash,created_at)
-          VALUES(?,?,?,?,?)`
-        ).run(
-          user.name,
-          user.email,
-          user.phone,
-          await bcrypt.hash(password, 12),
-          new Date().toISOString()
-        );
-
-      user.id =
-        info.lastInsertRowid;
-
-      const devOtp =
-        await sendOtp(user);
-
-      res
+      return res
         .status(201)
         .json({
           message:
             'Account created. Verify your email with the OTP.',
-
-          token:
-            tokenFor(user),
-
+          token: tokenFor(user),
           devOtp
         });
 
-    } catch (e) {
-
+    } catch (error) {
       console.error(
-        'Signup error:',
-        e
+        'New signup OTP error:',
+        error
       );
 
-      res
+      return res
         .status(500)
         .json({
           error:
-            'Unable to create account'
+            error.message ||
+            'Account created but verification email could not be sent.'
         });
     }
+
+  } catch (error) {
+    console.error(
+      'SIGNUP ERROR:',
+      error
+    );
+
+    return res
+      .status(500)
+      .json({
+        error: 'Unable to create account'
+      });
   }
-);
+});
 
 
-/* =========================
+/* =========================================================
    LOGIN
-========================= */
+   ========================================================= */
 
-app.post(
-  '/api/auth/login',
-  async (req, res) => {
-
+app.post('/api/auth/login', async (req, res) => {
+  try {
     const {
       email,
       password
     } = req.body || {};
 
-    const user =
-      db.prepare(
-        'SELECT * FROM users WHERE email=?'
-      ).get(
-        String(email || '')
-          .trim()
-          .toLowerCase()
-      );
+
+    const cleanEmail = String(email || '')
+      .trim()
+      .toLowerCase();
+
+
+    const user = db
+      .prepare(
+        'SELECT * FROM users WHERE email = ?'
+      )
+      .get(cleanEmail);
+
 
     if (
       !user ||
@@ -498,71 +601,97 @@ app.post(
         });
     }
 
+
     res.json({
-      token:
-        tokenFor(user),
+      token: tokenFor(user),
 
       user: {
         id: user.id,
         name: user.name,
         email: user.email,
-        verified:
-          Boolean(user.verified),
+        verified: Boolean(user.verified),
         points: user.points
       }
     });
+
+  } catch (error) {
+    console.error(
+      'LOGIN ERROR:',
+      error
+    );
+
+    res
+      .status(500)
+      .json({
+        error: 'Unable to login'
+      });
   }
-);
+});
 
 
-/* =========================
-   SEND EMAIL VERIFICATION OTP
-========================= */
+/* =========================================================
+   SEND VERIFICATION OTP
+   ========================================================= */
 
 app.post(
   '/api/auth/send-otp',
   auth,
   async (req, res) => {
-
     try {
+      const user = db
+        .prepare(`
+          SELECT
+            id,
+            name,
+            email,
+            verified
+          FROM users
+          WHERE id = ?
+        `)
+        .get(req.user.sub);
 
-      const user =
-        db.prepare(
-          'SELECT id,name,email FROM users WHERE id=?'
-        ).get(
-          req.user.sub
-        );
 
       if (!user) {
         return res
           .status(404)
           .json({
-            error:
-              'User not found'
+            error: 'User not found'
           });
       }
 
-      const devOtp =
-        await sendOtp(user);
+
+      if (user.verified) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'This email is already verified'
+          });
+      }
+
+
+      const devOtp = await createAndSendOtp(
+        user,
+        'verify'
+      );
+
 
       res.json({
-        message:
-          'OTP sent',
-
+        message: 'OTP sent',
         devOtp
       });
 
-    } catch (e) {
-
+    } catch (error) {
       console.error(
-        'Send OTP error:',
-        e
+        'SEND OTP ERROR:',
+        error
       );
 
       res
         .status(500)
         .json({
           error:
+            error.message ||
             'Unable to send OTP'
         });
     }
@@ -570,233 +699,32 @@ app.post(
 );
 
 
-/* =========================
+/* =========================================================
    VERIFY EMAIL OTP
-========================= */
+   ========================================================= */
 
 app.post(
   '/api/auth/verify-otp',
   auth,
   (req, res) => {
-
-    const {
-      code
-    } = req.body || {};
-
-    const row =
-      db.prepare(
-        `SELECT *
-         FROM otps
-         WHERE user_id=?
-         AND used=0
-         ORDER BY id DESC
-         LIMIT 1`
-      ).get(
-        req.user.sub
-      );
-
-    if (
-      !row ||
-      row.expires_at < Date.now() ||
-      row.attempts >= 5
-    ) {
-      return res
-        .status(400)
-        .json({
-          error:
-            'OTP expired or unavailable'
-        });
-    }
-
-    if (
-      hashOtp(
-        String(code || '')
-      ) !== row.code_hash
-    ) {
-
-      db.prepare(
-        'UPDATE otps SET attempts=attempts+1 WHERE id=?'
-      ).run(row.id);
-
-      return res
-        .status(400)
-        .json({
-          error:
-            'Incorrect OTP'
-        });
-    }
-
-    db.prepare(
-      'UPDATE otps SET used=1 WHERE id=?'
-    ).run(row.id);
-
-    db.prepare(
-      'UPDATE users SET verified=1 WHERE id=?'
-    ).run(req.user.sub);
-
-    res.json({
-      message:
-        'Email verified'
-    });
-  }
-);
-
-
-/* ==================================================
-   FORGOT PASSWORD — SEND OTP
-================================================== */
-
-app.post(
-  '/api/auth/forgot-password',
-  async (req, res) => {
-
     try {
-
-      const email =
-        String(
-          req.body?.email || ''
-        )
-        .trim()
-        .toLowerCase();
-
-      if (!email) {
-        return res
-          .status(400)
-          .json({
-            error:
-              'Email is required'
-          });
-      }
-
-      const user =
-        db.prepare(
-          'SELECT id,name,email FROM users WHERE email=?'
-        ).get(email);
-
-      /*
-        We intentionally return the same message
-        whether the email exists or not.
-      */
-
-      if (!user) {
-        return res.json({
-          message:
-            'If an account exists, a password reset OTP has been sent.'
-        });
-      }
-
-      await sendPasswordResetOtp(user);
-
-      res.json({
-        message:
-          'If an account exists, a password reset OTP has been sent.'
-      });
-
-    } catch (e) {
-
-      console.error(
-        'Forgot password error:',
-        e
-      );
-
-      res
-        .status(500)
-        .json({
-          error:
-            'Unable to send reset OTP'
-        });
-    }
-  }
-);
+      const {
+        code
+      } = req.body || {};
 
 
-/* ==================================================
-   FORGOT PASSWORD — RESET PASSWORD
-================================================== */
+      const row = db
+        .prepare(`
+          SELECT *
+          FROM otps
+          WHERE user_id = ?
+            AND purpose = 'verify'
+            AND used = 0
+          ORDER BY id DESC
+          LIMIT 1
+        `)
+        .get(req.user.sub);
 
-app.post(
-  '/api/auth/reset-password',
-  async (req, res) => {
-
-    try {
-
-      const email =
-        String(
-          req.body?.email || ''
-        )
-        .trim()
-        .toLowerCase();
-
-      const code =
-        String(
-          req.body?.code || ''
-        ).trim();
-
-      const newPassword =
-        String(
-          req.body?.newPassword || ''
-        );
-
-      if (
-        !email ||
-        !code ||
-        !newPassword
-      ) {
-        return res
-          .status(400)
-          .json({
-            error:
-              'Email, OTP and new password are required'
-          });
-      }
-
-      if (
-        !/^\d{6}$/.test(code)
-      ) {
-        return res
-          .status(400)
-          .json({
-            error:
-              'OTP must be a 6-digit code'
-          });
-      }
-
-      if (
-        newPassword.length < 8
-      ) {
-        return res
-          .status(400)
-          .json({
-            error:
-              'Password must be at least 8 characters'
-          });
-      }
-
-      const user =
-        db.prepare(
-          'SELECT id FROM users WHERE email=?'
-        ).get(email);
-
-      if (!user) {
-        return res
-          .status(400)
-          .json({
-            error:
-              'Invalid reset request'
-          });
-      }
-
-      const row =
-        db.prepare(
-          `SELECT *
-           FROM otps
-           WHERE user_id=?
-           AND used=0
-           ORDER BY id DESC
-           LIMIT 1`
-        ).get(
-          user.id
-        );
 
       if (
         !row ||
@@ -811,66 +739,293 @@ app.post(
           });
       }
 
-      /*
-        Check OTP.
-      */
+
+      const incomingHash = hashOtp(
+        String(code || '')
+      );
+
 
       if (
-        hashOtp(code) !==
-        row.code_hash
+        incomingHash !== row.code_hash
       ) {
+        db.prepare(`
+          UPDATE otps
+          SET attempts = attempts + 1
+          WHERE id = ?
+        `).run(row.id);
 
-        db.prepare(
-          'UPDATE otps SET attempts=attempts+1 WHERE id=?'
-        ).run(row.id);
 
         return res
           .status(400)
           .json({
-            error:
-              'Incorrect OTP'
+            error: 'Incorrect OTP'
           });
       }
 
+
+      db.prepare(`
+        UPDATE otps
+        SET used = 1
+        WHERE id = ?
+      `).run(row.id);
+
+
+      db.prepare(`
+        UPDATE users
+        SET verified = 1
+        WHERE id = ?
+      `).run(req.user.sub);
+
+
+      res.json({
+        message: 'Email verified'
+      });
+
+    } catch (error) {
+      console.error(
+        'VERIFY OTP ERROR:',
+        error
+      );
+
+      res
+        .status(500)
+        .json({
+          error:
+            'Unable to verify OTP'
+        });
+    }
+  }
+);
+
+
+/* =========================================================
+   FORGOT PASSWORD
+   ========================================================= */
+
+app.post(
+  '/api/auth/forgot-password',
+  async (req, res) => {
+    try {
+      const {
+        email
+      } = req.body || {};
+
+
+      const cleanEmail = String(email || '')
+        .trim()
+        .toLowerCase();
+
+
+      if (!cleanEmail) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'Email address is required'
+          });
+      }
+
+
+      const user = db
+        .prepare(`
+          SELECT
+            id,
+            name,
+            email,
+            verified
+          FROM users
+          WHERE email = ?
+        `)
+        .get(cleanEmail);
+
+
       /*
-        Hash the new password.
+       Always return a generic response for unknown
+       emails so the endpoint does not reveal whether
+       an account exists.
       */
+
+      if (!user || !user.verified) {
+        return res.json({
+          message:
+            'If an account exists with that email, a reset OTP has been sent.'
+        });
+      }
+
+
+      await createAndSendOtp(
+        user,
+        'reset'
+      );
+
+
+      res.json({
+        message:
+          'If an account exists with that email, a reset OTP has been sent.'
+      });
+
+    } catch (error) {
+      console.error(
+        'FORGOT PASSWORD ERROR:',
+        error
+      );
+
+      res
+        .status(500)
+        .json({
+          error:
+            error.message ||
+            'Unable to send password reset OTP'
+        });
+    }
+  }
+);
+
+
+/* =========================================================
+   RESET PASSWORD
+   ========================================================= */
+
+app.post(
+  '/api/auth/reset-password',
+  async (req, res) => {
+    try {
+      const {
+        email,
+        code,
+        newPassword
+      } = req.body || {};
+
+
+      const cleanEmail = String(email || '')
+        .trim()
+        .toLowerCase();
+
+
+      if (
+        !cleanEmail ||
+        !code ||
+        !newPassword
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'Email, OTP and new password are required'
+          });
+      }
+
+
+      if (
+        String(newPassword).length < 8
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'New password must be at least 8 characters'
+          });
+      }
+
+
+      const user = db
+        .prepare(`
+          SELECT *
+          FROM users
+          WHERE email = ?
+        `)
+        .get(cleanEmail);
+
+
+      if (!user || !user.verified) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'Invalid reset request'
+          });
+      }
+
+
+      const row = db
+        .prepare(`
+          SELECT *
+          FROM otps
+          WHERE user_id = ?
+            AND purpose = 'reset'
+            AND used = 0
+          ORDER BY id DESC
+          LIMIT 1
+        `)
+        .get(user.id);
+
+
+      if (
+        !row ||
+        row.expires_at < Date.now() ||
+        row.attempts >= 5
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'OTP expired or unavailable'
+          });
+      }
+
+
+      if (
+        hashOtp(String(code)) !==
+        row.code_hash
+      ) {
+        db.prepare(`
+          UPDATE otps
+          SET attempts = attempts + 1
+          WHERE id = ?
+        `).run(row.id);
+
+
+        return res
+          .status(400)
+          .json({
+            error: 'Incorrect OTP'
+          });
+      }
+
 
       const passwordHash =
         await bcrypt.hash(
-          newPassword,
+          String(newPassword),
           12
         );
 
-      /*
-        Update password.
-      */
 
-      db.prepare(
-        'UPDATE users SET password_hash=? WHERE id=?'
-      ).run(
+      db.prepare(`
+        UPDATE users
+        SET password_hash = ?
+        WHERE id = ?
+      `).run(
         passwordHash,
         user.id
       );
 
-      /*
-        Mark OTP as used.
-      */
 
-      db.prepare(
-        'UPDATE otps SET used=1 WHERE id=?'
-      ).run(row.id);
+      db.prepare(`
+        UPDATE otps
+        SET used = 1
+        WHERE id = ?
+      `).run(row.id);
+
 
       res.json({
         message:
           'Password reset successfully'
       });
 
-    } catch (e) {
-
+    } catch (error) {
       console.error(
-        'Reset password error:',
-        e
+        'RESET PASSWORD ERROR:',
+        error
       );
 
       res
@@ -884,62 +1039,76 @@ app.post(
 );
 
 
-/* =========================
+/* =========================================================
    CURRENT USER
-========================= */
+   ========================================================= */
 
 app.get(
   '/api/me',
   auth,
   (req, res) => {
+    try {
+      const user = db
+        .prepare(`
+          SELECT
+            id,
+            name,
+            email,
+            phone,
+            verified,
+            points,
+            created_at
+          FROM users
+          WHERE id = ?
+        `)
+        .get(req.user.sub);
 
-    const u =
-      db.prepare(
-        `SELECT
-          id,
-          name,
-          email,
-          phone,
-          verified,
-          points,
-          created_at
-         FROM users
-         WHERE id=?`
-      ).get(
-        req.user.sub
+
+      if (!user) {
+        return res
+          .status(404)
+          .json({
+            error:
+              'User not found'
+          });
+      }
+
+
+      res.json({
+        user: {
+          ...user,
+          verified: Boolean(
+            user.verified
+          )
+        }
+      });
+
+    } catch (error) {
+      console.error(
+        'ME ERROR:',
+        error
       );
 
-    if (!u) {
-      return res
-        .status(404)
+      res
+        .status(500)
         .json({
           error:
-            'User not found'
+            'Unable to load user'
         });
     }
-
-    res.json({
-      user: {
-        ...u,
-        verified:
-          Boolean(u.verified)
-      }
-    });
   }
 );
 
 
-/* =========================
-   RAZORPAY ORDER
-========================= */
+/* =========================================================
+   RAZORPAY CREATE ORDER
+   ========================================================= */
 
 app.post(
   '/api/payments/order',
   auth,
   async (req, res) => {
-
     try {
-
       if (!razorpay) {
         return res
           .status(503)
@@ -949,10 +1118,11 @@ app.post(
           });
       }
 
-      const amount =
-        Number(
-          req.body?.amount
-        );
+
+      const amount = Number(
+        req.body?.amount
+      );
+
 
       if (
         !Number.isInteger(amount) ||
@@ -966,25 +1136,31 @@ app.post(
           });
       }
 
+
       const order =
         await razorpay.orders.create({
           amount,
           currency: 'INR',
-
           receipt:
             `recyclr_${req.user.sub}_${Date.now()}`,
-
           notes: {
             user_id:
               String(req.user.sub)
           }
         });
 
-      db.prepare(
-        `INSERT INTO orders
-        (user_id,razorpay_order_id,amount,currency,status,created_at)
-        VALUES(?,?,?,?,?,?)`
-      ).run(
+
+      db.prepare(`
+        INSERT INTO orders (
+          user_id,
+          razorpay_order_id,
+          amount,
+          currency,
+          status,
+          created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
         req.user.sub,
         order.id,
         amount,
@@ -993,25 +1169,19 @@ app.post(
         new Date().toISOString()
       );
 
+
       res.json({
-        orderId:
-          order.id,
-
-        amount:
-          order.amount,
-
-        currency:
-          order.currency,
-
+        orderId: order.id,
+        amount: order.amount,
+        currency: order.currency,
         keyId:
           process.env.RAZORPAY_KEY_ID
       });
 
-    } catch (e) {
-
+    } catch (error) {
       console.error(
-        'Razorpay order error:',
-        e
+        'RAZORPAY ORDER ERROR:',
+        error
       );
 
       res
@@ -1025,99 +1195,122 @@ app.post(
 );
 
 
-/* =========================
-   RAZORPAY VERIFY
-========================= */
+/* =========================================================
+   RAZORPAY VERIFY PAYMENT
+   ========================================================= */
 
 app.post(
   '/api/payments/verify',
   auth,
   (req, res) => {
-
-    const {
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature
-    } = req.body || {};
-
-    const order =
-      db.prepare(
-        `SELECT *
-         FROM orders
-         WHERE razorpay_order_id=?
-         AND user_id=?`
-      ).get(
+    try {
+      const {
         razorpay_order_id,
-        req.user.sub
-      );
+        razorpay_payment_id,
+        razorpay_signature
+      } = req.body || {};
 
-    if (!order) {
-      return res
-        .status(404)
-        .json({
-          error:
-            'Order not found'
-        });
-    }
 
-    const expected =
-      crypto
-        .createHmac(
-          'sha256',
-          process.env.RAZORPAY_KEY_SECRET || ''
-        )
-        .update(
-          `${order.razorpay_order_id}|${razorpay_payment_id}`
-        )
-        .digest('hex');
+      const order = db
+        .prepare(`
+          SELECT *
+          FROM orders
+          WHERE razorpay_order_id = ?
+            AND user_id = ?
+        `)
+        .get(
+          razorpay_order_id,
+          req.user.sub
+        );
 
-    const received =
-      Buffer.from(
+
+      if (!order) {
+        return res
+          .status(404)
+          .json({
+            error:
+              'Order not found'
+          });
+      }
+
+
+      const expected =
+        crypto
+          .createHmac(
+            'sha256',
+            process.env.RAZORPAY_KEY_SECRET || ''
+          )
+          .update(
+            `${order.razorpay_order_id}|${razorpay_payment_id}`
+          )
+          .digest('hex');
+
+
+      const received = Buffer.from(
         String(
           razorpay_signature || ''
         )
       );
 
-    const expectedBuffer =
-      Buffer.from(expected);
 
-    if (
-      received.length !==
-        expectedBuffer.length ||
-      !crypto.timingSafeEqual(
-        expectedBuffer,
-        received
-      )
-    ) {
-      return res
-        .status(400)
+      const expectedBuffer =
+        Buffer.from(expected);
+
+
+      if (
+        received.length !==
+          expectedBuffer.length ||
+        !crypto.timingSafeEqual(
+          expectedBuffer,
+          received
+        )
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'Payment verification failed'
+          });
+      }
+
+
+      db.prepare(`
+        UPDATE orders
+        SET status = ?
+        WHERE id = ?
+      `).run(
+        'paid',
+        order.id
+      );
+
+
+      res.json({
+        message:
+          'Payment verified',
+        orderId:
+          order.razorpay_order_id
+      });
+
+    } catch (error) {
+      console.error(
+        'PAYMENT VERIFY ERROR:',
+        error
+      );
+
+      res
+        .status(500)
         .json({
           error:
-            'Payment verification failed'
+            'Unable to verify payment'
         });
     }
-
-    db.prepare(
-      'UPDATE orders SET status=? WHERE id=?'
-    ).run(
-      'paid',
-      order.id
-    );
-
-    res.json({
-      message:
-        'Payment verified',
-
-      orderId:
-        order.razorpay_order_id
-    });
   }
 );
 
 
-/* =========================
-   OPTIONAL STATIC FILES
-========================= */
+/* =========================================================
+   SERVE FRONTEND
+   ========================================================= */
 
 const __filename =
   fileURLToPath(import.meta.url);
@@ -1125,24 +1318,32 @@ const __filename =
 const __dirname =
   path.dirname(__filename);
 
+
+/*
+  IMPORTANT:
+  server.js is in the ROOT of the project.
+
+  Therefore we use __dirname directly,
+  NOT path.resolve(__dirname, '..')
+*/
+
 app.use(
   express.static(
-    path.resolve(
-      __dirname,
-      '..'
-    )
+    path.resolve(__dirname)
   )
 );
 
 
-/* =========================
+/* =========================================================
    ERROR HANDLER
-========================= */
+   ========================================================= */
 
 app.use(
   (err, req, res, next) => {
-
-    console.error(err);
+    console.error(
+      'SERVER ERROR:',
+      err
+    );
 
     res
       .status(500)
@@ -1154,15 +1355,28 @@ app.use(
 );
 
 
-/* =========================
+/* =========================================================
    START SERVER
-========================= */
+   ========================================================= */
 
 app.listen(
   PORT,
   () => {
     console.log(
-      `Recyclr API running on http://localhost:${PORT}`
+      `Recyclr API running on port ${PORT}`
+    );
+
+    console.log(
+      `Environment: ${process.env.NODE_ENV || 'development'}`
+    );
+
+    console.log(
+      `SMTP configured: ${Boolean(mailer)}`
+    );
+
+    console.log(
+      `Razorpay configured: ${Boolean(razorpay)}`
     );
   }
 );
+```
