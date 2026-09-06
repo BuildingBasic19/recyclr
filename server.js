@@ -110,7 +110,6 @@ function auth(req, res, next) {
   }
 }
 
-// Unified OTP sender — handles both verify and reset
 async function sendOtp(user, purpose = 'verify') {
   const code = String(crypto.randomInt(100000, 1000000));
 
@@ -132,8 +131,9 @@ async function sendOtp(user, purpose = 'verify') {
   if (mailer) {
     try {
       await mailer.sendMail({ from: process.env.MAIL_FROM || process.env.SMTP_USER, to: user.email, subject, text });
+      console.log(`OTP email sent successfully to ${user.email}`);
     } catch (err) {
-      // Invalidate OTP if email failed
+      console.error('SMTP EMAIL ERROR:', err);
       db.prepare('UPDATE otps SET used=1 WHERE user_id=? AND purpose=? AND used=0').run(user.id, purpose);
       throw new Error('Unable to send OTP email. Please check SMTP settings.');
     }
@@ -142,7 +142,12 @@ async function sendOtp(user, purpose = 'verify') {
   }
 
   // In dev mode return OTP so you can test without SMTP
-  return process.env.NODE_ENV === 'production' ? undefined : code;
+  if (process.env.NODE_ENV !== 'production') {
+    console.log(`[DEV OTP] ${purpose} OTP for ${user.email}: ${code}`);
+    return code;
+  }
+
+  return undefined;
 }
 
 // ─── ROUTES ─────────────────────────────────────────────────
@@ -162,7 +167,6 @@ app.post('/api/auth/signup', async (req, res) => {
     if (existing && existing.verified)
       return res.status(409).json({ error: 'An account with this email already exists' });
 
-    // Re-send OTP if account exists but not verified
     if (existing && !existing.verified) {
       const passwordHash = await bcrypt.hash(String(password), 12);
       db.prepare('UPDATE users SET name=?,phone=?,password_hash=? WHERE id=?')
@@ -176,7 +180,6 @@ app.post('/api/auth/signup', async (req, res) => {
       }
     }
 
-    // New account
     const passwordHash = await bcrypt.hash(String(password), 12);
     const info = db.prepare('INSERT INTO users(name,email,phone,password_hash,created_at) VALUES(?,?,?,?,?)')
       .run(name.trim(), cleanEmail, phone?.trim() || null, passwordHash, new Date().toISOString());
@@ -248,21 +251,16 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   try {
     const cleanEmail = String(req.body?.email || '').trim().toLowerCase();
     if (!cleanEmail) return res.status(400).json({ error: 'Email address is required' });
-
     const user = db.prepare('SELECT id,name,email,verified FROM users WHERE email=?').get(cleanEmail);
-
-    // Always return generic message so we don't reveal if account exists
     if (!user || !user.verified) {
       return res.json({ message: 'If an account exists with that email, a reset OTP has been sent.' });
     }
-
     try {
       const devOtp = await sendOtp(user, 'reset');
       return res.json({ message: 'If an account exists with that email, a reset OTP has been sent.', devOtp });
     } catch (err) {
       return res.status(500).json({ error: err.message || 'Unable to send password reset OTP' });
     }
-
   } catch (e) {
     console.error('FORGOT PASSWORD ERROR:', e);
     res.status(500).json({ error: 'Unable to send password reset OTP' });
@@ -274,32 +272,24 @@ app.post('/api/auth/reset-password', async (req, res) => {
   try {
     const { email, code, newPassword } = req.body || {};
     const cleanEmail = String(email || '').trim().toLowerCase();
-
     if (!cleanEmail || !code || !newPassword)
       return res.status(400).json({ error: 'Email, OTP and new password are required' });
-
     if (String(newPassword).length < 8)
       return res.status(400).json({ error: 'New password must be at least 8 characters' });
-
     const user = db.prepare('SELECT * FROM users WHERE email=?').get(cleanEmail);
     if (!user || !user.verified)
       return res.status(400).json({ error: 'Invalid reset request' });
-
     const row = db.prepare(`SELECT * FROM otps WHERE user_id=? AND purpose='reset' AND used=0 ORDER BY id DESC LIMIT 1`).get(user.id);
     if (!row || row.expires_at < Date.now() || row.attempts >= 5)
       return res.status(400).json({ error: 'OTP expired or unavailable' });
-
     if (hashOtp(String(code)) !== row.code_hash) {
       db.prepare('UPDATE otps SET attempts=attempts+1 WHERE id=?').run(row.id);
       return res.status(400).json({ error: 'Incorrect OTP' });
     }
-
     const passwordHash = await bcrypt.hash(String(newPassword), 12);
     db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(passwordHash, user.id);
     db.prepare('UPDATE otps SET used=1 WHERE id=?').run(row.id);
-
     res.json({ message: 'Password reset successfully' });
-
   } catch (e) {
     console.error('RESET PASSWORD ERROR:', e);
     res.status(500).json({ error: 'Unable to reset password' });
@@ -316,6 +306,15 @@ app.get('/api/me', auth, (req, res) => {
     console.error('ME ERROR:', e);
     res.status(500).json({ error: 'Unable to load user' });
   }
+});
+
+// ⚠️ TEMP ROUTE — remove after verifying your account
+app.get('/api/admin/verify-user/:email', (req, res) => {
+  const email = req.params.email.toLowerCase();
+  const user = db.prepare('SELECT * FROM users WHERE email=?').get(email);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  db.prepare('UPDATE users SET verified=1 WHERE email=?').run(email);
+  res.json({ message: 'User verified successfully', email });
 });
 
 // RAZORPAY CREATE ORDER
