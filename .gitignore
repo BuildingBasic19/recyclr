@@ -1,0 +1,5 @@
+.env
+recyclr.db
+recyclr.db-shm
+recyclr.db-wal
+node_modules/

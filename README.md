@@ -1,25 +1,9 @@
-# Recyclr — original frontend + backend
+# Recyclr backend
 
-This package keeps the **original Recyclr HTML/CSS design** and adds a real Node/Express backend for account authentication, OTP verification, and Razorpay payment verification.
+Node/Express API for authentication, email OTP verification and Razorpay payments.
 
-## Frontend
-- Plain HTML + original `styles.css` + vanilla `app.js`
-- GitHub Pages compatible
-- Relative links (works for repository/project pages)
-- Cart, shop filtering, recycle flow and theme remain client-side
+## Local
 
-## GitHub Pages + backend
-GitHub Pages can host only the frontend. Deploy the repository root to GitHub Pages, then edit `config.js`:
-
-```js
-window.RECYCLR_CONFIG = {
-  API_BASE_URL: 'https://YOUR-BACKEND.example.com'
-};
-```
-
-The backend must allow your exact GitHub Pages origin in `FRONTEND_ORIGIN`.
-
-## Backend local setup
 ```bash
 cd backend
 cp .env.example .env
@@ -27,12 +11,10 @@ npm install
 npm start
 ```
 
-Then open `http://localhost:3000`.
+For real email OTP, configure SMTP variables. In development only, the API returns `devOtp` to make local testing easy. Never use that shortcut in production.
 
-## Real services
-- **OTP:** configure SMTP in `.env`. In development, the API returns a development OTP to make testing easy; do not use that shortcut in production.
-- **Payments:** configure Razorpay test/live credentials. The Razorpay secret stays on the backend. The server verifies the payment signature before marking the order paid.
-- **Database:** SQLite is stored in `backend/recyclr.db` by default.
+For real payments, add Razorpay test credentials first. Keep `RAZORPAY_KEY_SECRET` server-side only.
 
-## Important
-Never commit `.env`, Razorpay secret keys, SMTP passwords, JWT secrets, or the SQLite production database to GitHub.
+## Production
+
+Deploy this folder to a Node-capable host such as Render, Railway or a VPS. GitHub Pages can host the frontend, but it cannot execute this backend. Set `FRONTEND_ORIGIN` to the exact GitHub Pages origin and configure all secrets in the host's environment variables.
