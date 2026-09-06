@@ -9,7 +9,7 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
-import nodemailer from 'nodemailer';
+import { Resend } from 'resend';
 import Razorpay from 'razorpay';
 
 const app = express();
@@ -72,13 +72,9 @@ app.use(cors({
 app.use(express.json({ limit: '100kb' }));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 300, standardHeaders: true, legacyHeaders: false }));
 
-const mailer = (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS)
-  ? nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: Number(process.env.SMTP_PORT || 587) === 465,
-      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-    })
+// Resend email client
+const resend = process.env.RESEND_API_KEY
+  ? new Resend(process.env.RESEND_API_KEY)
   : null;
 
 const razorpay = (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET)
@@ -120,31 +116,66 @@ async function sendOtp(user, purpose = 'verify') {
   db.prepare('INSERT INTO otps(user_id,code_hash,expires_at,created_at,purpose) VALUES(?,?,?,?,?)')
     .run(user.id, hashOtp(code), Date.now() + 10 * 60 * 1000, Date.now(), purpose);
 
+  // Dev mode — print OTP to logs, skip email
+  if (process.env.NODE_ENV !== 'production') {
+    console.log(`[DEV OTP] ${purpose} OTP for ${user.email}: ${code}`);
+    return code;
+  }
+
+  // Production — send via Resend
+  if (!resend) {
+    throw new Error('Email service is not configured. Add RESEND_API_KEY to environment variables.');
+  }
+
   const subject = purpose === 'reset'
     ? 'Your Recyclr password reset OTP'
     : 'Your Recyclr verification code';
 
-  const text = purpose === 'reset'
-    ? `Your Recyclr password reset OTP is ${code}. It expires in 10 minutes.`
-    : `Your Recyclr OTP is ${code}. It expires in 10 minutes.`;
+  const html = purpose === 'reset'
+    ? `
+      <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+        <h2 style="color:#15803D">♻️ Recyclr</h2>
+        <h3>Password Reset OTP</h3>
+        <p>Your password reset OTP is:</p>
+        <div style="font-size:36px;font-weight:bold;color:#15803D;letter-spacing:8px;text-align:center;padding:20px;background:#f0fdf4;border-radius:8px;margin:20px 0">
+          ${code}
+        </div>
+        <p style="color:#666">This OTP expires in 10 minutes. Do not share it with anyone.</p>
+        <p style="color:#666">If you didn't request this, ignore this email.</p>
+      </div>
+    `
+    : `
+      <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+        <h2 style="color:#15803D">♻️ Recyclr</h2>
+        <h3>Verify Your Email</h3>
+        <p>Welcome to Recyclr! Your verification OTP is:</p>
+        <div style="font-size:36px;font-weight:bold;color:#15803D;letter-spacing:8px;text-align:center;padding:20px;background:#f0fdf4;border-radius:8px;margin:20px 0">
+          ${code}
+        </div>
+        <p style="color:#666">This OTP expires in 10 minutes.</p>
+        <p style="color:#666">Start recycling and earn rewards today! 🌱</p>
+      </div>
+    `;
 
-  if (mailer) {
-    try {
-      await mailer.sendMail({ from: process.env.MAIL_FROM || process.env.SMTP_USER, to: user.email, subject, text });
-      console.log(`OTP email sent successfully to ${user.email}`);
-    } catch (err) {
-      console.error('SMTP EMAIL ERROR:', err);
+  try {
+    const { error } = await resend.emails.send({
+      from: process.env.MAIL_FROM || 'Recyclr <onboarding@resend.dev>',
+      to: user.email,
+      subject,
+      html
+    });
+
+    if (error) {
+      console.error('RESEND ERROR:', error);
       db.prepare('UPDATE otps SET used=1 WHERE user_id=? AND purpose=? AND used=0').run(user.id, purpose);
-      throw new Error('Unable to send OTP email. Please check SMTP settings.');
+      throw new Error('Unable to send OTP email.');
     }
-  } else if (process.env.NODE_ENV === 'production') {
-    throw new Error('Email service is not configured on the server');
-  }
 
-  // In dev mode return OTP so you can test without SMTP
-  if (process.env.NODE_ENV !== 'production') {
-    console.log(`[DEV OTP] ${purpose} OTP for ${user.email}: ${code}`);
-    return code;
+    console.log(`OTP email sent successfully to ${user.email}`);
+  } catch (err) {
+    console.error('RESEND SEND ERROR:', err);
+    db.prepare('UPDATE otps SET used=1 WHERE user_id=? AND purpose=? AND used=0').run(user.id, purpose);
+    throw new Error('Unable to send OTP email.');
   }
 
   return undefined;
@@ -162,11 +193,14 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(400).json({ error: 'Name, email and an 8+ character password are required' });
 
     const cleanEmail = email.trim().toLowerCase();
+
     const existing = db.prepare('SELECT * FROM users WHERE email=?').get(cleanEmail);
 
+    // Any existing account — return friendly error
     if (existing && existing.verified)
       return res.status(409).json({ error: 'An account with this email already exists' });
 
+    // Existing but unverified — resend OTP
     if (existing && !existing.verified) {
       const passwordHash = await bcrypt.hash(String(password), 12);
       db.prepare('UPDATE users SET name=?,phone=?,password_hash=? WHERE id=?')
@@ -180,6 +214,7 @@ app.post('/api/auth/signup', async (req, res) => {
       }
     }
 
+    // New account
     const passwordHash = await bcrypt.hash(String(password), 12);
     const info = db.prepare('INSERT INTO users(name,email,phone,password_hash,created_at) VALUES(?,?,?,?,?)')
       .run(name.trim(), cleanEmail, phone?.trim() || null, passwordHash, new Date().toISOString());
@@ -320,7 +355,7 @@ app.get('/api/admin/verify-user/:email', (req, res) => {
 // RAZORPAY CREATE ORDER
 app.post('/api/payments/order', auth, async (req, res) => {
   try {
-    if (!razorpay) return res.status(503).json({ error: 'Razorpay is not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET on the backend.' });
+    if (!razorpay) return res.status(503).json({ error: 'Razorpay is not configured.' });
     const amount = Number(req.body?.amount);
     if (!Number.isInteger(amount) || amount < 100) return res.status(400).json({ error: 'Invalid amount' });
     const order = await razorpay.orders.create({ amount, currency: 'INR', receipt: `recyclr_${req.user.sub}_${Date.now()}`, notes: { user_id: String(req.user.sub) } });
@@ -366,6 +401,6 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`Recyclr API running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`SMTP configured: ${Boolean(mailer)}`);
+  console.log(`Resend configured: ${Boolean(resend)}`);
   console.log(`Razorpay configured: ${Boolean(razorpay)}`);
 });
